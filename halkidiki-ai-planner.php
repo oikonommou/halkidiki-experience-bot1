@@ -572,26 +572,25 @@ function halkidiki_ai_get_category_families() {
     return [
 
         'food' => [
-            'Brunch',
-            'Cafe-Snacks',
             'Fast Food',
             'Pizza & Pasta',
             'Snack Bar',
-            'Άρτος & Γλυκό',
             'Εστιατόρια - Ταβέρνες',
-            'Εστιατόρια – Ταβέρνες',
-            'Παγωτό'
+            'Εστιατόρια – Ταβέρνες'
         ],
 
         'dessert' => [
             'Άρτος & Γλυκό',
             'Παγωτό',
-            'Cafe-Snacks'
+            'Cafe-Snacks',
+            'Brunch',
+            'Snack Bar'
         ],
 
         'coffee' => [
             'Brunch',
             'Cafe-Snacks',
+            'Snack Bar',
             'Cafe & Coctail',
             'Cafe & Cocktail'
         ],
@@ -600,7 +599,8 @@ function halkidiki_ai_get_category_families() {
             'Cafe & Coctail',
             'Cafe & Cocktail',
             'Beach Bars',
-            'Clubs'
+            'Clubs',
+            'Bars'
         ],
 
         'icecream' => [
@@ -1475,6 +1475,7 @@ function halkidiki_ai_clean_business_description($business, $intent, $region) {
     $desc = trim(wp_strip_all_tags($desc));
     if ($desc !== '') {
         $desc = preg_replace('/^' . preg_quote($name, '/') . '\s*[-–—:,.]?\s*/iu', '', $desc);
+        $desc = preg_replace('/^(to|το)\s+' . preg_quote($name, '/') . '\s*[-–—:,.]?\s*/iu', '', $desc);
         $desc = preg_replace('/^' . preg_quote(mb_strtoupper($name, 'UTF-8'), '/') . '\s*[-–—:,.]?\s*/u', '', $desc);
         $parts = preg_split('/[.!;;]/u', $desc);
         $desc = trim($parts[0] ?? $desc);
@@ -1541,11 +1542,26 @@ function halkidiki_ai_build_planner_reply_clean($message, $pending_context = [])
     $food_names = array_slice(array_map(function($b){ return $b['name'] ?? ''; }, $food['businesses'] ?? []), 0, 2);
     $drink_names = array_slice(array_map(function($b){ return $b['name'] ?? ''; }, $drink['businesses'] ?? []), 0, 2);
     $dataset_ctx = halkidiki_ai_build_planner_dataset_context($dataset, $region_name);
-    $reply = "Βεβαίως! Για μια όμορφη μέρα στο {$region_name}, θα σας πρότεινα:\n\nΠρωί:\nΞεκινήστε με χαλαρή βόλτα και καφέ στην περιοχή.\n\nΜεσημέρι:\n";
+    $beach = $dataset['about_the_area']['beaches'][0]['name'] ?? '';
+    $attr = $dataset['about_the_area']['attractions'][0]['name'] ?? ($dataset['about_the_area']['archaeological_sites'][0]['name'] ?? '');
+    $reply = "Βεβαίως! Για μια όμορφη μέρα στο {$region_name}, θα σας πρότεινα:\n\nΠρωί:\n";
+    if ($beach !== '') {
+        $reply .= "Ξεκινήστε με παραλία, ιδανικά προς {$beach}, και έναν χαλαρό καφέ στην περιοχή.\n\n";
+    } else {
+        $reply .= "Ξεκινήστε με χαλαρή βόλτα και καφέ στην περιοχή.\n\n";
+    }
+    $reply .= "Μεσημέρι:\n";
     $reply .= !empty($food_names) ? ('Για φαγητό μπορείτε να δείτε: ' . implode(', ', $food_names) . ".\n\n") : "Συνεχίστε με παραλία και ένα ήρεμο γεύμα στην περιοχή.\n\n";
-    $reply .= "Απόγευμα:\n{$dataset_ctx}\n\nΒράδυ:\n";
+    $reply .= "Απόγευμα:\n";
+    if ($attr !== '') {
+        $reply .= "Κάντε βόλτα και προσθέστε ένα σημείο ενδιαφέροντος όπως {$attr}.";
+    } else {
+        $reply .= "{$dataset_ctx}";
+    }
+    $reply .= "\n\nΒράδυ:\n";
     $reply .= !empty($drink_names) ? ('Για ποτό μπορείτε να δείτε: ' . implode(', ', $drink_names) . '.') : 'Κλείστε τη μέρα με μια χαλαρή βόλτα και ποτό στην περιοχή.';
     if ($style !== '') $reply .= "\n\nΈλαβα υπόψη και την προτίμησή σας για: {$style}.";
+    $reply .= "\n\nΑν θέλετε, μπορώ να το κάνω και πιο χαλαρό, πιο οικογενειακό ή πιο βραδινό.";
     return ['reply' => $reply, 'pending' => ['pending_region' => '', 'pending_intent' => '']];
 }
 
