@@ -905,14 +905,75 @@ function halkidiki_ai_filter_businesses_by_intent($items, $intent) {
         }
     }
 
+    // Keep permissive behavior: if keyword filtering removes everything while the query
+    // already applied taxonomy constraints, return original items to avoid over-pruning.
+    if (empty($filtered)) {
+        return array_values($items);
+    }
+
     return array_values($filtered);
 }
 
-function halkidiki_ai_get_filtered_businesses($message) {
+function halkidiki_ai_debug_log($payload) {
+    if (!defined('HALKIDIKI_AI_DEBUG') || !HALKIDIKI_AI_DEBUG) {
+        return;
+    }
+    error_log('HALKIDIKI_AI_DEBUG ' . wp_json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+}
+
+function halkidiki_ai_is_followup_message($message) {
+    $n = halkidiki_ai_normalize_text($message);
+    $tokens = ['αλλα', 'άλλα', 'περισσοτερα', 'περισσότερα', 'δειξε μου αλλα', 'εχει αλλα', 'more', 'show more', 'ναι', 'yes', 'και κοκτειλ', 'και καφε', 'και φαγητο'];
+    foreach ($tokens as $t) {
+        if (strpos($n, halkidiki_ai_normalize_text($t)) !== false) return true;
+    }
+    return false;
+}
+
+function halkidiki_ai_resolve_business_context($message, $history = [], $last_assistant_reply = '') {
+    $resolved = [
+        'selected_region' => '',
+        'selected_intent' => '',
+        'is_business_request' => false,
+        'is_more_request' => false,
+        'is_yes_nearby_request' => false,
+        'allow_nearby' => false,
+        'page' => 1,
+        'offset' => 0,
+        'base_query_message' => $message,
+        'needs_clarification' => false,
+    ];
+
+    $n = halkidiki_ai_normalize_text($message);
+    $is_more = (strpos($n, 'αλλα') !== false || strpos($n, 'άλλα') !== false || strpos($n, 'περισσοτερα') !== false || strpos($n, 'περισσότερα') !== false || strpos($n, 'show more') !== false || strpos($n, 'more') !== false);
+    $is_yes = in_array(trim($n), ['ναι', 'yes'], true);
+
+    $detected_intent = halkidiki_ai_detect_business_intent($message);
+    $is_current_business = halkidiki_ai_is_business_request($message, ['detected_intent' => $detected_intent['type'] ?? '']);
+    $taxes = halkidiki_ai_get_listing_taxonomies();
+    $region_map = halkidiki_ai_get_taxonomy_terms_map($taxes['region']);
+    $detected_region = halkidiki_ai_detect_region_from_message($message, $region_map);
+
+    $resolved['selected_region'] = $detected_region['name'] ?? '';
+    $resolved['selected_intent'] = $detected_intent['type'] ?? '';
+    $resolved['is_more_request'] = $is_more;
+    $resolved['is_yes_nearby_request'] = $is_yes;
+    $resolved['is_business_request'] = $is_current_business || $is_more || $is_yes;
+    $resolved['offset'] = max(0, ($resolved['page'] - 1) * 6);
+    // Stateless mode: nearby fallback is automatic only when exact is zero.
+    $resolved['allow_nearby'] = true;
+    if ($is_more || $is_yes || ($resolved['selected_region'] === '' && $resolved['selected_intent'] === '')) {
+        $resolved['needs_clarification'] = true;
+    }
+
+    return $resolved;
+}
+
+function halkidiki_ai_get_filtered_businesses($message, $context = null) {
     $post_type = halkidiki_ai_get_listing_post_type();
     $taxes = halkidiki_ai_get_listing_taxonomies();
 
-    $business_cache_key = halkidiki_ai_make_cache_key('businesses_v8', $message);
+    $business_cache_key = halkidiki_ai_make_cache_key('businesses_v10', ['message' => $message, 'context' => $context]);
     $cached_businesses = halkidiki_ai_get_cached($business_cache_key);
 
     if ($cached_businesses !== false && is_array($cached_businesses)) {
@@ -925,6 +986,21 @@ function halkidiki_ai_get_filtered_businesses($message) {
 
     $detected_region = halkidiki_ai_detect_region_from_message($message, $region_map);
     $intent = halkidiki_ai_detect_business_intent($message);
+    if (is_array($context)) {
+        if (!empty($context['selected_region'])) {
+            foreach ($region_map as $region_item) {
+                if (halkidiki_ai_normalize_text($region_item['name']) === halkidiki_ai_normalize_text($context['selected_region'])) {
+                    $detected_region = $region_item;
+                    break;
+                }
+            }
+        }
+        if (!empty($context['selected_intent'])) {
+            $intent = ['type' => $context['selected_intent'], 'category_keywords' => [], 'feature_keywords' => []];
+            $intent_from_type = halkidiki_ai_detect_business_intent($context['selected_intent']);
+            if (!empty($intent_from_type['type'])) $intent = $intent_from_type;
+        }
+    }
 
     $category_term_ids = halkidiki_ai_find_matching_term_ids($category_map, $intent['category_keywords']);
     $feature_term_ids = halkidiki_ai_find_matching_term_ids($feature_map, $intent['feature_keywords']);
@@ -1060,7 +1136,8 @@ $description = wp_trim_words($description, 24, '...');
             'posts_per_page'         => $limit,
             'no_found_rows'          => true,
             'ignore_sticky_posts'    => true,
-            'orderby'                => 'rand',
+            'orderby'                => 'title',
+            'order'                  => 'ASC',
             'fields'                 => 'ids',
             'post__not_in'           => array_map('intval', $exclude_ids),
             'update_post_meta_cache' => false,
@@ -1088,13 +1165,18 @@ $description = wp_trim_words($description, 24, '...');
     $used_post_ids = [];
     $nearby_region_names = [];
 
+    $debug = [];
     if (!empty($requested_region_name) && !empty($taxes['region'])) {
         $exact_term_ids = $find_region_term_ids([$requested_region_name]);
-        $exact_ids = !empty($exact_term_ids) ? $run_query($exact_term_ids, 24, []) : [];
+        $exact_ids = !empty($exact_term_ids) ? $run_query($exact_term_ids, 200, []) : [];
 
 $exact_items = $hydrate_posts($exact_ids, 'exact', $requested_region_name);
+$debug['exact_candidates_before_filter'] = $exact_items;
 $exact_items = halkidiki_ai_filter_businesses_by_intent($exact_items, $intent);
-$exact_items = array_slice($exact_items, 0, 6);
+$debug['exact_candidates_after_filter'] = $exact_items;
+$offset = is_array($context) ? (int) ($context['offset'] ?? 0) : 0;
+$exact_total = count($exact_items);
+$exact_items = array_slice($exact_items, $offset, 6);
 
 $results = array_merge($results, $exact_items);
 $used_post_ids = array_merge($used_post_ids, $exact_ids);
@@ -1107,13 +1189,23 @@ $exact_count = count($exact_items);
                 && halkidiki_ai_normalize_text($name) !== halkidiki_ai_normalize_text('Χαλκιδική');
         }));
 
-        if ($exact_count < 3 && !empty($nearby_region_names)) {
+        $allow_nearby = is_array($context) ? !empty($context['allow_nearby']) : true;
+        if ($exact_total === 0 && $allow_nearby && !empty($nearby_region_names)) {
             $nearby_term_ids = $find_region_term_ids($nearby_region_names);
-            $nearby_ids = !empty($nearby_term_ids) ? $run_query($nearby_term_ids, 24, $used_post_ids) : [];
+            $nearby_ids = !empty($nearby_term_ids) ? $run_query($nearby_term_ids, 200, $used_post_ids) : [];
 
 $nearby_items = $hydrate_posts($nearby_ids, 'nearby', $requested_region_name);
 $nearby_items = halkidiki_ai_filter_businesses_by_intent($nearby_items, $intent);
-$nearby_items = array_slice($nearby_items, 0, max(0, 6 - $exact_count));
+$nearby_items = array_values(array_filter($nearby_items, function($item) use ($nearby_region_names) {
+    $dr = $item['display_region'] ?? '';
+    if ($dr === '') return false;
+    foreach ($nearby_region_names as $near) {
+        if (halkidiki_ai_normalize_text($dr) === halkidiki_ai_normalize_text($near)) return true;
+    }
+    return false;
+}));
+$debug['nearby_candidates_after_filter'] = $nearby_items;
+$nearby_items = array_slice($nearby_items, $offset, 6);
 
 $nearby_count = count($nearby_items);
 $results = array_merge($results, $nearby_items);
@@ -1133,6 +1225,8 @@ $used_post_ids = array_merge($used_post_ids, $nearby_ids);
         'exact_count'          => $exact_count,
         'nearby_count'         => $nearby_count,
         'nearby_region_names'  => $nearby_region_names,
+        'exact_total'          => isset($exact_total) ? $exact_total : $exact_count,
+        'debug'                => $debug,
     ];
 
     halkidiki_ai_set_cached($business_cache_key, $final_data, 600);
@@ -1180,6 +1274,43 @@ function halkidiki_ai_build_businesses_text($message) {
 $lines[] = "- {$business['name']} | Match: {$scope} | Display region: {$display_region} | Categories: {$cat} | Regions: {$reg} | Features: {$feat} | Description: {$desc} | Link: {$business['link']}";
     }
 
+    return implode("\n", $lines);
+}
+
+function halkidiki_ai_build_deterministic_business_reply($context, $business_data) {
+    $region = $context['selected_region'] ?? '';
+    $items = $business_data['businesses'] ?? [];
+    if (!empty($context['is_yes_nearby_request']) || !empty($context['is_more_request'])) {
+        return 'Σε ποια περιοχή και για τι είδους επιλογή θέλετε να ψάξω;';
+    }
+    if (!empty($context['needs_clarification'])) {
+        return 'Μπορείτε να μου πείτε περιοχή και τι ακριβώς θέλετε (π.χ. καφέ, φαγητό), για να σας δείξω σωστές επιλογές;';
+    }
+    if (empty($items)) {
+        return 'Δεν βρήκα διαθέσιμες συνεργαζόμενες επιλογές για αυτό που ζητάτε.';
+    }
+    $lines = [];
+    if (($business_data['exact_total'] ?? 0) === 0 && !empty($region) && !empty($business_data['nearby_count'])) {
+        $lines[] = "Δεν βρήκα διαθέσιμη συνεργαζόμενη επιλογή ακριβώς στην {$region} για αυτό που ζητάτε. Μπορείτε όμως να δείτε κοντινές επιλογές:";
+    } else {
+        $lines[] = "Για αυτό που αναζητάτε στο/στην {$region}, μπορείτε να δείτε:";
+    }
+    foreach ($items as $b) {
+        $name = html_entity_decode((string) ($b['name'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $scope = $b['match_scope'] ?? 'exact';
+        $disp = $b['display_region'] ?? '';
+        $cat = !empty($b['categories']) ? implode(', ', $b['categories']) : 'συνεργαζόμενη επιλογή';
+        $desc = 'Ταιριάζει σε αυτό που ζητάτε.';
+        if (!empty($cat)) $desc = 'Κατηγορία: ' . $cat . '.';
+        if ($scope === 'nearby' && $disp !== '') {
+            $lines[] = "Κοντινή επιλογή στη {$disp}: {$name} — {$desc}";
+        } else {
+            $lines[] = "- {$name} — {$desc}";
+        }
+    }
+    if (($business_data['exact_total'] ?? 0) > (($context['offset'] ?? 0) + 6)) {
+        $lines[] = 'Υπάρχουν και άλλες ακριβείς επιλογές. Αν θέλετε, πείτε «άλλα».';
+    }
     return implode("\n", $lines);
 }
 
@@ -1586,8 +1717,22 @@ function halkidiki_ai_chat_endpoint(WP_REST_Request $request) {
         ], 400);
     }
 
-    $reply = halkidiki_ai_call_deepseek($message, $history);
-$business_data = halkidiki_ai_get_filtered_businesses($message);
+    $last_assistant_reply = '';
+    if (is_array($history)) {
+        for ($i = count($history) - 1; $i >= 0; $i--) {
+            if (($history[$i]['role'] ?? '') === 'assistant') {
+                $last_assistant_reply = (string) ($history[$i]['content'] ?? '');
+                break;
+            }
+        }
+    }
+    $resolved_context = halkidiki_ai_resolve_business_context($message, $history, $last_assistant_reply);
+    $business_data = halkidiki_ai_get_filtered_businesses($message, $resolved_context);
+    if (!empty($resolved_context['is_business_request'])) {
+        $reply = halkidiki_ai_build_deterministic_business_reply($resolved_context, $business_data);
+    } else {
+        $reply = halkidiki_ai_call_deepseek($message, $history);
+    }
 
 $business_cards = [];
 $reply_normalized = halkidiki_ai_normalize_text($reply);
@@ -1612,7 +1757,22 @@ if (!empty($business_data['businesses']) && is_array($business_data['businesses'
     }
 }
 
-	halkidiki_ai_log_interaction($message, $business_data);
+        halkidiki_ai_debug_log([
+            'raw_user_message' => $message,
+            'history_length' => is_array($history) ? count($history) : 0,
+            'resolved_context' => $resolved_context,
+            'detected_region' => $business_data['detected_region'] ?? '',
+            'detected_intent' => $business_data['detected_intent'] ?? '',
+            'exact_count' => $business_data['exact_count'] ?? 0,
+            'nearby_count' => $business_data['nearby_count'] ?? 0,
+            'nearby_region_names' => $business_data['nearby_region_names'] ?? [],
+            'debug_lists' => $business_data['debug'] ?? [],
+            'final_businesses' => array_map(function($b){
+                return ['name'=>$b['name'] ?? '', 'display_region'=>$b['display_region'] ?? '', 'match_scope'=>$b['match_scope'] ?? ''];
+            }, $business_data['businesses'] ?? []),
+        ]);
+
+		halkidiki_ai_log_interaction($message, $business_data);
 
 	return new WP_REST_Response([
     'success' => true,
