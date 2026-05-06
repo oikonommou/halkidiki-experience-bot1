@@ -1033,6 +1033,7 @@ function halkidiki_ai_resolve_business_context($message, $history = [], $last_as
         $resolved['needs_clarification'] = ($resolved['selected_region'] === '' || $resolved['selected_intent'] === '');
     }
     if ($is_yes && !$resolved['is_yes_nearby_request']) $resolved['needs_clarification'] = true;
+    if (!empty($resolved['selected_region']) && !empty($resolved['selected_intent'])) $resolved['needs_clarification'] = false;
     $resolved['offset'] = max(0, ($resolved['page'] - 1) * 6);
 
     return $resolved;
@@ -1134,9 +1135,16 @@ if (empty($description)) {
     $description = get_post_field('post_content', $post_id);
 }
 
-$description = wp_strip_all_tags($description);
+$description = html_entity_decode(wp_strip_all_tags($description), ENT_QUOTES | ENT_HTML5, 'UTF-8');
 $description = trim(preg_replace('/\s+/', ' ', $description));
-$description = wp_trim_words($description, 24, '...');
+$title_norm = halkidiki_ai_normalize_text($title);
+$desc_norm = halkidiki_ai_normalize_text($description);
+if ($title_norm !== '' && strpos($desc_norm, $title_norm) === 0) {
+    $description = trim(preg_replace('/^' . preg_quote($title, '/') . '\s*[-–—:,.]?\s*/iu', '', $description));
+}
+$sentence = preg_split('/[.!;;]/u', $description);
+$description = trim($sentence[0] ?? $description);
+$description = wp_trim_words($description, 18, '...');
 
             $categories = [];
             if (!empty($taxes['category'])) {
@@ -1243,6 +1251,9 @@ $exact_items = $hydrate_posts($exact_ids, 'exact', $requested_region_name);
 $debug['exact_candidates_before_filter'] = $exact_items;
 $exact_items = halkidiki_ai_filter_businesses_by_intent($exact_items, $intent);
 $debug['exact_candidates_after_filter'] = $exact_items;
+$before_names = array_map(function($i){ return $i['name'] ?? ''; }, $debug['exact_candidates_before_filter']);
+$after_names = array_map(function($i){ return $i['name'] ?? ''; }, $debug['exact_candidates_after_filter']);
+$debug['exact_removed_by_intent_filter'] = array_values(array_diff($before_names, $after_names));
 $offset = is_array($context) ? (int) ($context['offset'] ?? 0) : 0;
 $exact_total = count($exact_items);
 $exact_items = array_slice($exact_items, $offset, 6);
@@ -1281,8 +1292,7 @@ $results = array_merge($results, $nearby_items);
 $used_post_ids = array_merge($used_post_ids, $nearby_ids);
         }
     } else {
-        $ids = $run_query([], 6, []);
-        $results = $hydrate_posts($ids, 'general', '');
+        $results = [];
     }
 
     $results = array_slice($results, 0, 6);
@@ -1383,6 +1393,9 @@ function halkidiki_ai_build_deterministic_business_reply($context, $business_dat
             $desc = 'Μια καλή επιλογή';
             if ($disp !== '') $desc .= ' στην περιοχή ' . $disp;
             $desc .= ' για αυτό που ζητάτε.';
+        }
+        if (halkidiki_ai_normalize_text($name) === halkidiki_ai_normalize_text($desc)) {
+            $desc = 'Μια καλή επιλογή για αυτό που ζητάτε.';
         }
         if ($scope === 'nearby' && $disp !== '') {
             $lines[] = "Κοντινή επιλογή στη {$disp}: {$name} — {$desc}";
