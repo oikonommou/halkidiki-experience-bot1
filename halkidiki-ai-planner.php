@@ -1409,6 +1409,69 @@ function halkidiki_ai_build_deterministic_business_reply($context, $business_dat
     return implode("\n", $lines);
 }
 
+function halkidiki_ai_detect_region_clean($message, $region_map) {
+    return halkidiki_ai_detect_region_canonical($message, $region_map);
+}
+
+function halkidiki_ai_detect_intent_clean($message) {
+    return halkidiki_ai_detect_business_intent($message);
+}
+
+function halkidiki_ai_resolve_pending_context_clean($message, $pending_context, $region_map) {
+    $region = halkidiki_ai_detect_region_clean($message, $region_map);
+    $intent = halkidiki_ai_detect_intent_clean($message);
+    $resolved = [
+        'current_region' => $region['name'] ?? '',
+        'current_intent' => $intent['type'] ?? '',
+        'final_region' => $region['name'] ?? '',
+        'final_intent' => $intent['type'] ?? '',
+        'needs_clarification' => false,
+        'pending_out' => ['pending_region' => '', 'pending_intent' => ''],
+    ];
+    if ($resolved['final_region'] !== '' && $resolved['final_intent'] === '' && !empty($pending_context['pending_intent'])) {
+        $resolved['final_intent'] = $pending_context['pending_intent'];
+    } elseif ($resolved['final_region'] === '' && $resolved['final_intent'] !== '' && !empty($pending_context['pending_region'])) {
+        $resolved['final_region'] = $pending_context['pending_region'];
+    }
+    if ($resolved['final_region'] === '' || $resolved['final_intent'] === '') {
+        $resolved['needs_clarification'] = true;
+        $resolved['pending_out'] = ['pending_region' => $resolved['final_region'], 'pending_intent' => $resolved['final_intent']];
+    }
+    return $resolved;
+}
+
+function halkidiki_ai_query_businesses_clean($final_region, $final_intent) {
+    $ctx = ['selected_region' => $final_region, 'selected_intent' => $final_intent, 'allow_nearby' => true, 'offset' => 0];
+    return halkidiki_ai_get_filtered_businesses($final_region . ' ' . $final_intent, $ctx);
+}
+
+function halkidiki_ai_format_business_reply_clean($resolved, $data) {
+    if ($resolved['final_region'] === '' && $resolved['final_intent'] !== '') return 'Σε ποια περιοχή θέλετε να το δω;';
+    if ($resolved['final_region'] !== '' && $resolved['final_intent'] === '') return 'Τι είδους επιλογή ψάχνετε στο/στην ' . $resolved['final_region'] . '; φαγητό, καφέ, ποτό, brunch ή κάτι άλλο;';
+    if ($resolved['final_region'] === '' && $resolved['final_intent'] === '') return 'Μπορείτε να μου πείτε περιοχή και τι ακριβώς θέλετε (π.χ. καφέ, φαγητό), για να σας δείξω σωστές επιλογές;';
+    $items = $data['businesses'] ?? [];
+    if (empty($items)) return 'Δεν βρήκα διαθέσιμες συνεργαζόμενες επιλογές για αυτό που ζητάτε.';
+    $lines = [];
+    if (($data['exact_total'] ?? 0) > 0) {
+        $lines[] = 'Για αυτό που αναζητάτε στο ' . $resolved['final_region'] . ', μπορείτε να δείτε:';
+    } else {
+        $lines[] = 'Στην ' . $resolved['final_region'] . ' δεν βρήκα ακριβώς ταιριαστές συνεργαζόμενες επιλογές, αλλά μπορείτε να δείτε κοντινές επιλογές:';
+    }
+    foreach (array_slice($items, 0, 6) as $b) {
+        $name = html_entity_decode((string)($b['name'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $desc = trim((string)($b['description'] ?? ''));
+        if ($desc === '' || halkidiki_ai_normalize_text($desc) === halkidiki_ai_normalize_text($name)) {
+            $desc = 'Μια καλή επιλογή για αυτό που ζητάτε.';
+        }
+        if (($b['match_scope'] ?? '') === 'nearby') {
+            $lines[] = '- Κοντινή επιλογή στην ' . ($b['display_region'] ?? '') . ': ' . $name . ' — ' . $desc;
+        } else {
+            $lines[] = '- ' . $name . ' — ' . $desc;
+        }
+    }
+    return implode("\n", $lines);
+}
+
 function halkidiki_ai_is_business_request($message, $business_data = []) {
     $normalized = halkidiki_ai_normalize_text($message);
 
@@ -1816,29 +1879,21 @@ function halkidiki_ai_chat_endpoint(WP_REST_Request $request) {
         ], 400);
     }
 
-    $last_assistant_reply = '';
-    if (is_array($history)) {
-        for ($i = count($history) - 1; $i >= 0; $i--) {
-            if (($history[$i]['role'] ?? '') === 'assistant') {
-                $last_assistant_reply = (string) ($history[$i]['content'] ?? '');
-                break;
-            }
-        }
-    }
-    $resolved_context = halkidiki_ai_resolve_business_context($message, $history, $last_assistant_reply);
-    $business_data = halkidiki_ai_get_filtered_businesses($message, $resolved_context);
+    $taxes = halkidiki_ai_get_listing_taxonomies();
+    $region_map = halkidiki_ai_get_taxonomy_terms_map($taxes['region']);
+    $resolved_clean = halkidiki_ai_resolve_pending_context_clean($message, $pending_context, $region_map);
     $route = 'ai';
-    if (!empty($resolved_context['is_business_request'])) {
-        $route = !empty($resolved_context['needs_clarification']) ? 'clarification' : 'business_reply';
-        $reply = halkidiki_ai_build_deterministic_business_reply($resolved_context, $business_data);
+    $business_data = ['businesses' => []];
+    if ($resolved_clean['final_region'] !== '' || $resolved_clean['final_intent'] !== '' || !empty($resolved_clean['needs_clarification'])) {
+        $route = $resolved_clean['needs_clarification'] ? 'clarification' : 'business_reply';
+        if (!$resolved_clean['needs_clarification']) {
+            $business_data = halkidiki_ai_query_businesses_clean($resolved_clean['final_region'], $resolved_clean['final_intent']);
+        }
+        $reply = halkidiki_ai_format_business_reply_clean($resolved_clean, $business_data);
     } else {
         $reply = halkidiki_ai_call_deepseek($message, $history);
     }
-    $out_pending = ['pending_region' => '', 'pending_intent' => ''];
-    if (!empty($resolved_context['needs_clarification'])) {
-        $out_pending['pending_region'] = $resolved_context['selected_region'] ?? '';
-        $out_pending['pending_intent'] = $resolved_context['selected_intent'] ?? '';
-    }
+    $out_pending = $resolved_clean['pending_out'];
 
 $business_cards = [];
 $reply_normalized = halkidiki_ai_normalize_text($reply);
@@ -1866,7 +1921,7 @@ if (!empty($business_data['businesses']) && is_array($business_data['businesses'
         halkidiki_ai_debug_log([
             'raw_user_message' => $message,
             'history_length' => is_array($history) ? count($history) : 0,
-            'resolved_context' => $resolved_context,
+            'resolved_context' => $resolved_clean,
             'detected_region' => $business_data['detected_region'] ?? '',
             'detected_intent' => $business_data['detected_intent'] ?? '',
             'exact_count' => $business_data['exact_count'] ?? 0,
@@ -1877,12 +1932,12 @@ if (!empty($business_data['businesses']) && is_array($business_data['businesses'
                 return ['name'=>$b['name'] ?? '', 'display_region'=>$b['display_region'] ?? '', 'match_scope'=>$b['match_scope'] ?? ''];
             }, $business_data['businesses'] ?? []),
             'normalized_message' => halkidiki_ai_normalize_text($message),
-            'current_region_detected' => $resolved_context['selected_region'] ?? '',
-            'current_intent_detected' => $resolved_context['selected_intent'] ?? '',
+            'current_region_detected' => $resolved_clean['current_region'] ?? '',
+            'current_intent_detected' => $resolved_clean['current_intent'] ?? '',
             'pending_region_received' => $pending_context['pending_region'] ?? '',
             'pending_intent_received' => $pending_context['pending_intent'] ?? '',
-            'final_region' => $resolved_context['selected_region'] ?? '',
-            'final_intent' => $resolved_context['selected_intent'] ?? '',
+            'final_region' => $resolved_clean['final_region'] ?? '',
+            'final_intent' => $resolved_clean['final_intent'] ?? '',
             'route' => $route,
         ]);
 
