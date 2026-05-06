@@ -95,7 +95,10 @@ function halkidiki_ai_get_dataset() {
 function halkidiki_ai_normalize_text($text) {
     $text = wp_strip_all_tags($text);
     $text = trim($text);
-    return mb_strtolower($text, 'UTF-8');
+    $text = mb_strtolower($text, 'UTF-8');
+    $from = ['ά','έ','ή','ί','ό','ύ','ώ','ϊ','ΐ','ϋ','ΰ','ς'];
+    $to   = ['α','ε','η','ι','ο','υ','ω','ι','ι','υ','υ','σ'];
+    return str_replace($from, $to, $text);
 }
 
 function halkidiki_ai_limit_history($history, $max = 6) {
@@ -678,6 +681,7 @@ function halkidiki_ai_detect_business_intent($message) {
     }
 
     if (
+        strpos($normalized, 'φαω') !== false ||
         strpos($normalized, 'εστιατ') !== false ||
         strpos($normalized, 'ταβερν') !== false ||
         strpos($normalized, 'φαγητ') !== false ||
@@ -953,7 +957,7 @@ function halkidiki_ai_resolve_business_context($message, $history = [], $last_as
     $resolved['is_more_request'] = $is_more;
     $assistant_norm = halkidiki_ai_normalize_text((string) $last_assistant_reply);
     $resolved['is_yes_nearby_request'] = $is_yes && (strpos($assistant_norm, 'κοντιν') !== false || strpos($assistant_norm, 'nearby') !== false);
-    $resolved['is_business_request'] = $is_current_business || $is_more || $is_yes;
+    $resolved['is_business_request'] = $is_current_business || $is_more || $is_yes || !empty($resolved['selected_region']) || !empty($resolved['selected_intent']);
     $resolved['allow_nearby'] = true;
 
     if ($is_more && is_array($history)) {
@@ -1319,6 +1323,12 @@ function halkidiki_ai_build_deterministic_business_reply($context, $business_dat
         return 'Δεν υπάρχουν άλλες διαθέσιμες επιλογές σε αυτό το φίλτρο. Αν θέλετε, αλλάξτε περιοχή ή κατηγορία.';
     }
     if (!empty($context['needs_clarification'])) {
+        if (!empty($context['selected_region']) && empty($context['selected_intent'])) {
+            return 'Τι είδους επιλογή ψάχνετε στο/στην ' . $context['selected_region'] . '; φαγητό, καφέ, ποτό, brunch ή κάτι άλλο;';
+        }
+        if (empty($context['selected_region']) && !empty($context['selected_intent'])) {
+            return 'Σε ποια περιοχή θέλετε να το δω;';
+        }
         return 'Μπορείτε να μου πείτε περιοχή και τι ακριβώς θέλετε (π.χ. καφέ, φαγητό), για να σας δείξω σωστές επιλογές;';
     }
     if (empty($items)) {
