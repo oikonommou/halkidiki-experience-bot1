@@ -1532,6 +1532,42 @@ function halkidiki_ai_build_planner_reply_clean($message, $pending_context = [])
     return ['reply' => $reply, 'pending' => ['pending_region' => '', 'pending_intent' => '']];
 }
 
+function halkidiki_ai_resolve_route_clean($message, $pending_context, $planner_context) {
+    $route = ['route' => 'ai', 'region' => '', 'intent' => '', 'pendingContext' => ['pending_region'=>'','pending_intent'=>''], 'plannerContext' => ['active'=>false,'type'=>'']];
+    if (halkidiki_ai_detect_smalltalk($message)) {
+        $route['route'] = 'smalltalk';
+        return $route;
+    }
+    if (!empty($planner_context['active'])) {
+        $route['route'] = 'planner_reply';
+        $route['plannerContext'] = ['active'=>false,'type'=>''];
+        return $route;
+    }
+    if (halkidiki_ai_detect_planner_request($message)) {
+        $taxes = halkidiki_ai_get_listing_taxonomies();
+        $region_map = halkidiki_ai_get_taxonomy_terms_map($taxes['region']);
+        $region = halkidiki_ai_detect_region_clean($message, $region_map);
+        if (!empty($region['name'])) {
+            $route['route'] = 'planner_reply';
+            return $route;
+        }
+        $route['route'] = 'planner_clarification';
+        $route['plannerContext'] = ['active'=>true,'type'=>'day_plan'];
+        return $route;
+    }
+    $taxes = halkidiki_ai_get_listing_taxonomies();
+    $region_map = halkidiki_ai_get_taxonomy_terms_map($taxes['region']);
+    $resolved = halkidiki_ai_resolve_pending_context_clean($message, $pending_context, $region_map);
+    $route['region'] = $resolved['final_region'];
+    $route['intent'] = $resolved['final_intent'];
+    $route['pendingContext'] = $resolved['pending_out'];
+    if ($resolved['final_region'] !== '' || $resolved['final_intent'] !== '' || !empty($resolved['needs_clarification'])) {
+        $route['route'] = $resolved['needs_clarification'] ? 'business_clarification' : 'business_reply';
+        return $route;
+    }
+    return $route;
+}
+
 function halkidiki_ai_is_business_request($message, $business_data = []) {
     $normalized = halkidiki_ai_normalize_text($message);
 
@@ -1928,6 +1964,7 @@ function halkidiki_ai_chat_endpoint(WP_REST_Request $request) {
     $message = isset($params['message']) ? sanitize_textarea_field($params['message']) : '';
     $history = isset($params['history']) ? $params['history'] : [];
     $pending_context = isset($params['pendingContext']) && is_array($params['pendingContext']) ? $params['pendingContext'] : [];
+    $planner_context = isset($params['plannerContext']) && is_array($params['plannerContext']) ? $params['plannerContext'] : ['active'=>false,'type'=>''];
     if (is_array($history)) {
         $history['_pending_context'] = $pending_context;
     }
@@ -1939,33 +1976,38 @@ function halkidiki_ai_chat_endpoint(WP_REST_Request $request) {
         ], 400);
     }
 
-    $taxes = halkidiki_ai_get_listing_taxonomies();
-    $region_map = halkidiki_ai_get_taxonomy_terms_map($taxes['region']);
-    $route = 'ai';
+    $route_data = halkidiki_ai_resolve_route_clean($message, $pending_context, $planner_context);
+    $route = $route_data['route'];
     $business_data = ['businesses' => []];
-    $resolved_clean = ['current_region'=>'','current_intent'=>'','final_region'=>'','final_intent'=>''];
-    $out_pending = ['pending_region' => '', 'pending_intent' => ''];
+    $out_pending = $route_data['pendingContext'];
+    $out_planner = $route_data['plannerContext'];
+    $resolved_clean = ['current_region'=>$route_data['region'],'current_intent'=>$route_data['intent'],'final_region'=>$route_data['region'],'final_intent'=>$route_data['intent']];
 
-    if (halkidiki_ai_detect_smalltalk($message)) {
-        $route = 'smalltalk';
-        $reply = halkidiki_ai_build_smalltalk_reply($message);
-    } elseif (halkidiki_ai_detect_planner_request($message)) {
-        $route = 'planner';
-        $planner = halkidiki_ai_build_planner_reply_clean($message, $pending_context);
-        $reply = $planner['reply'];
-        $out_pending = $planner['pending'];
-    } else {
-        $resolved_clean = halkidiki_ai_resolve_pending_context_clean($message, $pending_context, $region_map);
-        if ($resolved_clean['final_region'] !== '' || $resolved_clean['final_intent'] !== '' || !empty($resolved_clean['needs_clarification'])) {
-            $route = $resolved_clean['needs_clarification'] ? 'clarification' : 'business_reply';
-            if (!$resolved_clean['needs_clarification']) {
-                $business_data = halkidiki_ai_query_businesses_clean($resolved_clean['final_region'], $resolved_clean['final_intent']);
+    switch ($route) {
+        case 'smalltalk':
+            $reply = halkidiki_ai_build_smalltalk_reply($message);
+            break;
+        case 'planner_clarification':
+            $reply = 'Από ποια περιοχή ξεκινάτε και τι ύφος θέλετε; παραλία, φαγητό, βόλτα ή βραδινή έξοδο;';
+            break;
+        case 'planner_reply':
+            $planner = halkidiki_ai_build_planner_reply_clean($message, $pending_context);
+            $reply = $planner['reply'];
+            $out_pending = $planner['pending'];
+            $out_planner = ['active'=>false,'type'=>''];
+            break;
+        case 'business_clarification':
+        case 'business_reply':
+            if ($route === 'business_reply') {
+                $business_data = halkidiki_ai_query_businesses_clean($route_data['region'], $route_data['intent']);
             }
-            $reply = halkidiki_ai_format_business_reply_clean($resolved_clean, $business_data);
-            $out_pending = $resolved_clean['pending_out'];
-        } else {
+            $reply = halkidiki_ai_format_business_reply_clean([
+                'final_region' => $route_data['region'],
+                'final_intent' => $route_data['intent']
+            ], $business_data);
+            break;
+        default:
             $reply = halkidiki_ai_call_deepseek($message, $history);
-        }
     }
 
 $business_cards = [];
@@ -2021,6 +2063,7 @@ if (!empty($business_data['businesses']) && is_array($business_data['businesses'
     'reply' => $reply,
     'businesses' => $business_cards,
     'pendingContext' => $out_pending,
+    'plannerContext' => $out_planner,
 	], 200);
 }
 
@@ -2145,6 +2188,7 @@ function halkidiki_ai_planner_shortcode() {
 
         let history = [];
         let pendingContext = { pending_region: '', pending_intent: '' };
+        let plannerContext = { active: false, type: '' };
         let isSending = false;
 
         function appendMessage(sender, text, alignRight = false, isError = false, businesses = []) {
@@ -2255,7 +2299,8 @@ if (businesses && businesses.length) {
                     body: JSON.stringify({
                         message: message,
                         history: history,
-                        pendingContext: pendingContext
+                        pendingContext: pendingContext,
+                        plannerContext: plannerContext
                     })
                 });
 
@@ -2272,6 +2317,11 @@ if (businesses && businesses.length) {
                         pendingContext = data.pendingContext;
                     } else {
                         pendingContext = { pending_region: '', pending_intent: '' };
+                    }
+                    if (data.plannerContext && typeof data.plannerContext === 'object') {
+                        plannerContext = data.plannerContext;
+                    } else {
+                        plannerContext = { active: false, type: '' };
                     }
 
 
