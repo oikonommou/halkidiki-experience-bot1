@@ -101,6 +101,42 @@ function halkidiki_ai_normalize_text($text) {
     return str_replace($from, $to, $text);
 }
 
+function halkidiki_ai_detect_region_canonical($message, $regions_map) {
+    $normalized = halkidiki_ai_normalize_text(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $message));
+    $alias_map = [
+        'Πευκοχώρι' => ['πευκοχωρι','pefkochori','pefkohori','pefko chori','pefkoxori','peukochori','pefkoχωρι'],
+        'Άφυτος' => ['αφυτο','αφυτος','afytos','afitos','afithos','afytos halkidiki'],
+        'Καλλιθέα' => ['καλλιθεα','kallithea','kalithea'],
+        'Χανιώτη' => ['χανιωτη','hanioti','chanioti','xanioti'],
+        'Πολύχρονο' => ['πολυχρονο','polychrono','polichrono'],
+        'Κρυοπηγή' => ['κρυοπηγη','kriopigi','kryopigi'],
+        'Παλιούρι' => ['παλιουρι','paliouri','palioyri'],
+        'Νέα Φώκεα' => ['νεα φωκεα','νεα φωκαια','nea fokea','nea fokaia'],
+        'Νέα Ποτίδαια' => ['νεα ποτιδαια','nea potidaia'],
+        'Σίβηρη' => ['σιβηρη','siviri'],
+        'Σκάλα Φούρκας' => ['σκαλα φουρκασ','skala fourkas'],
+        'Φούρκα' => ['φουρκα','fourka'],
+        'Ποσείδι' => ['ποσειδι','poseidi'],
+        'Καλάνδρα' => ['καλανδρα','kalandra'],
+        'Αγία Παρασκευή' => ['αγια παρασκευη','agia paraskevi'],
+        'Λουτρά' => ['λουτρα','loutra'],
+        'Νέα Σκιώνη' => ['νεα σκιωνη','nea skioni'],
+        'Μόλα Καλύβα' => ['μολα καλυβα','mola kalyva'],
+        'Κασσάνδρα' => ['κασσανδρα','kassandra'],
+    ];
+    foreach ($alias_map as $canonical => $aliases) {
+        foreach ($aliases as $alias) {
+            if (strpos($normalized, halkidiki_ai_normalize_text($alias)) !== false) {
+                foreach ($regions_map as $region) {
+                    if (halkidiki_ai_normalize_text($region['name']) === halkidiki_ai_normalize_text($canonical)) return $region;
+                }
+                return ['name' => $canonical, 'term_id' => 0, 'slug' => '', 'norm' => halkidiki_ai_normalize_text($canonical)];
+            }
+        }
+    }
+    return halkidiki_ai_detect_region_from_message($message, $regions_map);
+}
+
 function halkidiki_ai_limit_history($history, $max = 6) {
     if (!is_array($history)) {
         return [];
@@ -633,7 +669,11 @@ function halkidiki_ai_detect_business_intent($message) {
 
     if (
         strpos($normalized, 'γλυκ') !== false ||
+        strpos($normalized, 'κρεπα') !== false ||
+        strpos($normalized, 'παγωτο') !== false ||
         strpos($normalized, 'dessert') !== false ||
+        strpos($normalized, 'ice cream') !== false ||
+        strpos($normalized, 'crepe') !== false ||
         strpos($normalized, 'sweet') !== false
     ) {
         $intent['type'] = 'dessert';
@@ -715,6 +755,8 @@ function halkidiki_ai_detect_business_intent($message) {
         strpos($normalized, 'μπαρ') !== false ||
         strpos($normalized, 'bar') !== false ||
         strpos($normalized, 'ποτο') !== false ||
+        strpos($normalized, 'ποτα') !== false ||
+        strpos($normalized, 'κοκτειλ') !== false ||
         strpos($normalized, 'ποτό') !== false ||
         strpos($normalized, 'cocktail') !== false
     ) {
@@ -737,6 +779,7 @@ function halkidiki_ai_detect_business_intent($message) {
 
     if (
         strpos($normalized, 'καφε') !== false ||
+        strpos($normalized, 'καφεδακι') !== false ||
         strpos($normalized, 'καφέ') !== false ||
         strpos($normalized, 'cafe') !== false ||
         strpos($normalized, 'coffee') !== false
@@ -950,7 +993,8 @@ function halkidiki_ai_resolve_business_context($message, $history = [], $last_as
     $is_current_business = halkidiki_ai_is_business_request($message, ['detected_intent' => $detected_intent['type'] ?? '']);
     $taxes = halkidiki_ai_get_listing_taxonomies();
     $region_map = halkidiki_ai_get_taxonomy_terms_map($taxes['region']);
-    $detected_region = halkidiki_ai_detect_region_from_message($message, $region_map);
+    $pending = (is_array($history) && isset($history['_pending_context']) && is_array($history['_pending_context'])) ? $history['_pending_context'] : [];
+    $detected_region = halkidiki_ai_detect_region_canonical($message, $region_map);
 
     $resolved['selected_region'] = $detected_region['name'] ?? '';
     $resolved['selected_intent'] = $detected_intent['type'] ?? '';
@@ -984,19 +1028,8 @@ function halkidiki_ai_resolve_business_context($message, $history = [], $last_as
             $resolved['needs_clarification'] = true;
         }
     } elseif ($resolved['selected_region'] === '' || $resolved['selected_intent'] === '') {
-        // narrow clarification carry-over only from immediately previous assistant clarification
-        if (
-            is_array($history) &&
-            strpos($assistant_norm, 'πειτε μου περιοχη') !== false
-        ) {
-            $last_user = '';
-            for ($i = count($history)-1; $i >= 0; $i--) {
-                if (($history[$i]['role'] ?? '') === 'user') { $last_user = (string)$history[$i]['content']; break; }
-            }
-            $base = halkidiki_ai_resolve_business_context($last_user, [], '');
-            if ($resolved['selected_region'] === '' && $base['selected_region'] !== '') $resolved['selected_region'] = $base['selected_region'];
-            if ($resolved['selected_intent'] === '' && $base['selected_intent'] !== '') $resolved['selected_intent'] = $base['selected_intent'];
-        }
+        if ($resolved['selected_region'] === '' && !empty($pending['pending_region'])) $resolved['selected_region'] = $pending['pending_region'];
+        if ($resolved['selected_intent'] === '' && !empty($pending['pending_intent'])) $resolved['selected_intent'] = $pending['pending_intent'];
         $resolved['needs_clarification'] = ($resolved['selected_region'] === '' || $resolved['selected_intent'] === '');
     }
     if ($is_yes && !$resolved['is_yes_nearby_request']) $resolved['needs_clarification'] = true;
@@ -1020,7 +1053,7 @@ function halkidiki_ai_get_filtered_businesses($message, $context = null) {
     $category_map = halkidiki_ai_get_taxonomy_terms_map($taxes['category']);
     $feature_map = halkidiki_ai_get_taxonomy_terms_map($taxes['feature']);
 
-    $detected_region = halkidiki_ai_detect_region_from_message($message, $region_map);
+    $detected_region = halkidiki_ai_detect_region_canonical($message, $region_map);
     $intent = halkidiki_ai_detect_business_intent($message);
     if (is_array($context)) {
         if (!empty($context['selected_region'])) {
@@ -1758,6 +1791,10 @@ function halkidiki_ai_chat_endpoint(WP_REST_Request $request) {
 
     $message = isset($params['message']) ? sanitize_textarea_field($params['message']) : '';
     $history = isset($params['history']) ? $params['history'] : [];
+    $pending_context = isset($params['pendingContext']) && is_array($params['pendingContext']) ? $params['pendingContext'] : [];
+    if (is_array($history)) {
+        $history['_pending_context'] = $pending_context;
+    }
 
     if (empty($message)) {
         return new WP_REST_Response([
@@ -1777,10 +1814,17 @@ function halkidiki_ai_chat_endpoint(WP_REST_Request $request) {
     }
     $resolved_context = halkidiki_ai_resolve_business_context($message, $history, $last_assistant_reply);
     $business_data = halkidiki_ai_get_filtered_businesses($message, $resolved_context);
+    $route = 'ai';
     if (!empty($resolved_context['is_business_request'])) {
+        $route = !empty($resolved_context['needs_clarification']) ? 'clarification' : 'business_reply';
         $reply = halkidiki_ai_build_deterministic_business_reply($resolved_context, $business_data);
     } else {
         $reply = halkidiki_ai_call_deepseek($message, $history);
+    }
+    $out_pending = ['pending_region' => '', 'pending_intent' => ''];
+    if (!empty($resolved_context['needs_clarification'])) {
+        $out_pending['pending_region'] = $resolved_context['selected_region'] ?? '';
+        $out_pending['pending_intent'] = $resolved_context['selected_intent'] ?? '';
     }
 
 $business_cards = [];
@@ -1819,6 +1863,14 @@ if (!empty($business_data['businesses']) && is_array($business_data['businesses'
             'final_businesses' => array_map(function($b){
                 return ['name'=>$b['name'] ?? '', 'display_region'=>$b['display_region'] ?? '', 'match_scope'=>$b['match_scope'] ?? ''];
             }, $business_data['businesses'] ?? []),
+            'normalized_message' => halkidiki_ai_normalize_text($message),
+            'current_region_detected' => $resolved_context['selected_region'] ?? '',
+            'current_intent_detected' => $resolved_context['selected_intent'] ?? '',
+            'pending_region_received' => $pending_context['pending_region'] ?? '',
+            'pending_intent_received' => $pending_context['pending_intent'] ?? '',
+            'final_region' => $resolved_context['selected_region'] ?? '',
+            'final_intent' => $resolved_context['selected_intent'] ?? '',
+            'route' => $route,
         ]);
 
 		halkidiki_ai_log_interaction($message, $business_data);
@@ -1827,6 +1879,7 @@ if (!empty($business_data['businesses']) && is_array($business_data['businesses'
     'success' => true,
     'reply' => $reply,
     'businesses' => $business_cards,
+    'pendingContext' => $out_pending,
 	], 200);
 }
 
@@ -1950,6 +2003,7 @@ function halkidiki_ai_planner_shortcode() {
         const endpoint = '<?php echo esc_url(rest_url('halkidiki-ai/v1/chat')); ?>';
 
         let history = [];
+        let pendingContext = { pending_region: '', pending_intent: '' };
         let isSending = false;
 
         function appendMessage(sender, text, alignRight = false, isError = false, businesses = []) {
@@ -2059,7 +2113,8 @@ if (businesses && businesses.length) {
                     },
                     body: JSON.stringify({
                         message: message,
-                        history: history
+                        history: history,
+                        pendingContext: pendingContext
                     })
                 });
 
@@ -2072,6 +2127,11 @@ if (businesses && businesses.length) {
 					appendMessage('Halkidiki Bot', data.message ? data.message : 'Κάτι πήγε στραβά.', false, true);
 				} else {
 					appendMessage('Halkidiki Bot', data.reply, false, false, data.businesses || []);
+                    if (data.pendingContext && typeof data.pendingContext === 'object') {
+                        pendingContext = data.pendingContext;
+                    } else {
+                        pendingContext = { pending_region: '', pending_intent: '' };
+                    }
 
 
 					history.push({ role: 'user', content: message });
