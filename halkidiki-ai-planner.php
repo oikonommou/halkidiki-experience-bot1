@@ -1472,6 +1472,66 @@ function halkidiki_ai_format_business_reply_clean($resolved, $data) {
     return implode("\n", $lines);
 }
 
+function halkidiki_ai_detect_smalltalk($message) {
+    $n = halkidiki_ai_normalize_text($message);
+    $patterns = ['γεια','γεια σου','γεια σας','καλημερα','καλησπερα','ευχαριστω','ευχαριστω πολυ','τελεια','οκ','okay','thanks','thank you'];
+    foreach ($patterns as $p) {
+        if (strpos($n, $p) !== false) return true;
+    }
+    return false;
+}
+
+function halkidiki_ai_build_smalltalk_reply($message) {
+    $n = halkidiki_ai_normalize_text($message);
+    if (strpos($n, 'ευχαριστ') !== false) return 'Παρακαλώ, χαρά μου! Αν θέλετε, μπορώ να σας βοηθήσω με φαγητό, καφέ, παραλίες ή ένα μικρό πρόγραμμα για τη μέρα σας στη Χαλκιδική.';
+    if (strpos($n, 'τελεια') !== false) return 'Χαίρομαι πολύ! Είμαι εδώ αν θέλετε κι άλλη πρόταση για παραλία, φαγητό, ποτό ή πρόγραμμα ημέρας.';
+    return 'Γεια σας! Πείτε μου περιοχή και τι ψάχνετε — φαγητό, καφέ, ποτό, παραλία ή πρόγραμμα — και θα σας προτείνω κάτι ταιριαστό.';
+}
+
+function halkidiki_ai_detect_planner_request($message) {
+    $n = halkidiki_ai_normalize_text($message);
+    $tokens = ['προγραμμα','πλανο','day plan','itinerary','εκδρομη','οργανωσε μου τη μερα','τι να κανω σημερα','μια μερα','μια ημερα'];
+    foreach ($tokens as $t) if (strpos($n, halkidiki_ai_normalize_text($t)) !== false) return true;
+    return false;
+}
+
+function halkidiki_ai_build_planner_dataset_context($dataset, $region = '') {
+    $parts = [];
+    foreach (['beaches' => 'Παραλίες', 'attractions' => 'Αξιοθέατα', 'archaeological_sites' => 'Αρχαιολογικοί χώροι'] as $k => $label) {
+        if (!empty($dataset['about_the_area'][$k]) && is_array($dataset['about_the_area'][$k])) {
+            $slice = array_slice($dataset['about_the_area'][$k], 0, 3);
+            $names = array_map(function($i){ return $i['name'] ?? ''; }, $slice);
+            $parts[] = $label . ': ' . implode(', ', array_filter($names));
+        }
+    }
+    if (empty($parts)) return 'Υπάρχουν περιορισμένα διαθέσιμα δεδομένα περιοχής.';
+    return implode(' | ', $parts);
+}
+
+function halkidiki_ai_build_planner_reply_clean($message, $pending_context = []) {
+    $dataset = halkidiki_ai_get_dataset();
+    $taxes = halkidiki_ai_get_listing_taxonomies();
+    $region_map = halkidiki_ai_get_taxonomy_terms_map($taxes['region']);
+    $region = halkidiki_ai_detect_region_clean($message, $region_map);
+    $intent = halkidiki_ai_detect_intent_clean($message);
+    $region_name = $region['name'] ?? '';
+    $style = $intent['type'] ?? '';
+    if ($region_name === '') {
+        return ['reply' => 'Από ποια περιοχή ξεκινάτε και τι ύφος θέλετε; παραλία, φαγητό, βόλτα ή βραδινή έξοδο;', 'pending' => ['pending_region' => '', 'pending_intent' => '']];
+    }
+    $food = halkidiki_ai_query_businesses_clean($region_name, 'food');
+    $drink = halkidiki_ai_query_businesses_clean($region_name, 'drink');
+    $food_names = array_slice(array_map(function($b){ return $b['name'] ?? ''; }, $food['businesses'] ?? []), 0, 2);
+    $drink_names = array_slice(array_map(function($b){ return $b['name'] ?? ''; }, $drink['businesses'] ?? []), 0, 2);
+    $dataset_ctx = halkidiki_ai_build_planner_dataset_context($dataset, $region_name);
+    $reply = "Βεβαίως! Για μια όμορφη μέρα στο {$region_name}, θα σας πρότεινα:\n\nΠρωί:\nΞεκινήστε με χαλαρή βόλτα και καφέ στην περιοχή.\n\nΜεσημέρι:\n";
+    $reply .= !empty($food_names) ? ('Για φαγητό μπορείτε να δείτε: ' . implode(', ', $food_names) . ".\n\n") : "Συνεχίστε με παραλία και ένα ήρεμο γεύμα στην περιοχή.\n\n";
+    $reply .= "Απόγευμα:\n{$dataset_ctx}\n\nΒράδυ:\n";
+    $reply .= !empty($drink_names) ? ('Για ποτό μπορείτε να δείτε: ' . implode(', ', $drink_names) . '.') : 'Κλείστε τη μέρα με μια χαλαρή βόλτα και ποτό στην περιοχή.';
+    if ($style !== '') $reply .= "\n\nΈλαβα υπόψη και την προτίμησή σας για: {$style}.";
+    return ['reply' => $reply, 'pending' => ['pending_region' => '', 'pending_intent' => '']];
+}
+
 function halkidiki_ai_is_business_request($message, $business_data = []) {
     $normalized = halkidiki_ai_normalize_text($message);
 
@@ -1881,19 +1941,32 @@ function halkidiki_ai_chat_endpoint(WP_REST_Request $request) {
 
     $taxes = halkidiki_ai_get_listing_taxonomies();
     $region_map = halkidiki_ai_get_taxonomy_terms_map($taxes['region']);
-    $resolved_clean = halkidiki_ai_resolve_pending_context_clean($message, $pending_context, $region_map);
     $route = 'ai';
     $business_data = ['businesses' => []];
-    if ($resolved_clean['final_region'] !== '' || $resolved_clean['final_intent'] !== '' || !empty($resolved_clean['needs_clarification'])) {
-        $route = $resolved_clean['needs_clarification'] ? 'clarification' : 'business_reply';
-        if (!$resolved_clean['needs_clarification']) {
-            $business_data = halkidiki_ai_query_businesses_clean($resolved_clean['final_region'], $resolved_clean['final_intent']);
-        }
-        $reply = halkidiki_ai_format_business_reply_clean($resolved_clean, $business_data);
+    $resolved_clean = ['current_region'=>'','current_intent'=>'','final_region'=>'','final_intent'=>''];
+    $out_pending = ['pending_region' => '', 'pending_intent' => ''];
+
+    if (halkidiki_ai_detect_smalltalk($message)) {
+        $route = 'smalltalk';
+        $reply = halkidiki_ai_build_smalltalk_reply($message);
+    } elseif (halkidiki_ai_detect_planner_request($message)) {
+        $route = 'planner';
+        $planner = halkidiki_ai_build_planner_reply_clean($message, $pending_context);
+        $reply = $planner['reply'];
+        $out_pending = $planner['pending'];
     } else {
-        $reply = halkidiki_ai_call_deepseek($message, $history);
+        $resolved_clean = halkidiki_ai_resolve_pending_context_clean($message, $pending_context, $region_map);
+        if ($resolved_clean['final_region'] !== '' || $resolved_clean['final_intent'] !== '' || !empty($resolved_clean['needs_clarification'])) {
+            $route = $resolved_clean['needs_clarification'] ? 'clarification' : 'business_reply';
+            if (!$resolved_clean['needs_clarification']) {
+                $business_data = halkidiki_ai_query_businesses_clean($resolved_clean['final_region'], $resolved_clean['final_intent']);
+            }
+            $reply = halkidiki_ai_format_business_reply_clean($resolved_clean, $business_data);
+            $out_pending = $resolved_clean['pending_out'];
+        } else {
+            $reply = halkidiki_ai_call_deepseek($message, $history);
+        }
     }
-    $out_pending = $resolved_clean['pending_out'];
 
 $business_cards = [];
 $reply_normalized = halkidiki_ai_normalize_text($reply);
