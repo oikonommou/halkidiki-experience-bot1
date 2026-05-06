@@ -905,12 +905,6 @@ function halkidiki_ai_filter_businesses_by_intent($items, $intent) {
         }
     }
 
-    // Keep permissive behavior: if keyword filtering removes everything while the query
-    // already applied taxonomy constraints, return original items to avoid over-pruning.
-    if (empty($filtered)) {
-        return array_values($items);
-    }
-
     return array_values($filtered);
 }
 
@@ -945,7 +939,7 @@ function halkidiki_ai_resolve_business_context($message, $history = [], $last_as
     ];
 
     $n = halkidiki_ai_normalize_text($message);
-    $is_more = (strpos($n, 'αλλα') !== false || strpos($n, 'άλλα') !== false || strpos($n, 'περισσοτερα') !== false || strpos($n, 'περισσότερα') !== false || strpos($n, 'show more') !== false || strpos($n, 'more') !== false);
+    $is_more = (strpos($n, 'αλλα') !== false || strpos($n, 'άλλα') !== false || strpos($n, 'περισσοτερα') !== false || strpos($n, 'περισσότερα') !== false || strpos($n, 'show more') !== false || trim($n) === 'more');
     $is_yes = in_array(trim($n), ['ναι', 'yes'], true);
 
     $detected_intent = halkidiki_ai_detect_business_intent($message);
@@ -957,14 +951,52 @@ function halkidiki_ai_resolve_business_context($message, $history = [], $last_as
     $resolved['selected_region'] = $detected_region['name'] ?? '';
     $resolved['selected_intent'] = $detected_intent['type'] ?? '';
     $resolved['is_more_request'] = $is_more;
-    $resolved['is_yes_nearby_request'] = $is_yes;
+    $assistant_norm = halkidiki_ai_normalize_text((string) $last_assistant_reply);
+    $resolved['is_yes_nearby_request'] = $is_yes && (strpos($assistant_norm, 'κοντιν') !== false || strpos($assistant_norm, 'nearby') !== false);
     $resolved['is_business_request'] = $is_current_business || $is_more || $is_yes;
-    $resolved['offset'] = max(0, ($resolved['page'] - 1) * 6);
-    // Stateless mode: nearby fallback is automatic only when exact is zero.
     $resolved['allow_nearby'] = true;
-    if ($is_more || $is_yes || ($resolved['selected_region'] === '' && $resolved['selected_intent'] === '')) {
-        $resolved['needs_clarification'] = true;
+
+    if ($is_more && is_array($history)) {
+        $anchor = null;
+        $more_count = 1;
+        for ($i = count($history) - 1; $i >= 0; $i--) {
+            if (($history[$i]['role'] ?? '') !== 'user') continue;
+            $m = trim((string)($history[$i]['content'] ?? ''));
+            $mn = halkidiki_ai_normalize_text($m);
+            if (in_array($mn, ['άλλα', 'αλλα', 'περισσότερα', 'περισσοτερα', 'more', 'show more'], true)) {
+                $more_count++;
+                continue;
+            }
+            $anchor = $m;
+            break;
+        }
+        if ($anchor) {
+            $base = halkidiki_ai_resolve_business_context($anchor, [], '');
+            $resolved['selected_region'] = $base['selected_region'];
+            $resolved['selected_intent'] = $base['selected_intent'];
+            $resolved['page'] = $more_count;
+            $resolved['needs_clarification'] = ($resolved['selected_region'] === '' || $resolved['selected_intent'] === '');
+        } else {
+            $resolved['needs_clarification'] = true;
+        }
+    } elseif ($resolved['selected_region'] === '' || $resolved['selected_intent'] === '') {
+        // narrow clarification carry-over only from immediately previous assistant clarification
+        if (
+            is_array($history) &&
+            strpos($assistant_norm, 'πειτε μου περιοχη') !== false
+        ) {
+            $last_user = '';
+            for ($i = count($history)-1; $i >= 0; $i--) {
+                if (($history[$i]['role'] ?? '') === 'user') { $last_user = (string)$history[$i]['content']; break; }
+            }
+            $base = halkidiki_ai_resolve_business_context($last_user, [], '');
+            if ($resolved['selected_region'] === '' && $base['selected_region'] !== '') $resolved['selected_region'] = $base['selected_region'];
+            if ($resolved['selected_intent'] === '' && $base['selected_intent'] !== '') $resolved['selected_intent'] = $base['selected_intent'];
+        }
+        $resolved['needs_clarification'] = ($resolved['selected_region'] === '' || $resolved['selected_intent'] === '');
     }
+    if ($is_yes && !$resolved['is_yes_nearby_request']) $resolved['needs_clarification'] = true;
+    $resolved['offset'] = max(0, ($resolved['page'] - 1) * 6);
 
     return $resolved;
 }
@@ -1280,8 +1312,11 @@ $lines[] = "- {$business['name']} | Match: {$scope} | Display region: {$display_
 function halkidiki_ai_build_deterministic_business_reply($context, $business_data) {
     $region = $context['selected_region'] ?? '';
     $items = $business_data['businesses'] ?? [];
-    if (!empty($context['is_yes_nearby_request']) || !empty($context['is_more_request'])) {
-        return 'Σε ποια περιοχή και για τι είδους επιλογή θέλετε να ψάξω;';
+    if (!empty($context['is_yes_nearby_request']) && empty($items)) {
+        return 'Δεν βρήκα κοντινές συνεργαζόμενες επιλογές για αυτό που ζητάτε.';
+    }
+    if (!empty($context['is_more_request']) && empty($items)) {
+        return 'Δεν υπάρχουν άλλες διαθέσιμες επιλογές σε αυτό το φίλτρο. Αν θέλετε, αλλάξτε περιοχή ή κατηγορία.';
     }
     if (!empty($context['needs_clarification'])) {
         return 'Μπορείτε να μου πείτε περιοχή και τι ακριβώς θέλετε (π.χ. καφέ, φαγητό), για να σας δείξω σωστές επιλογές;';
@@ -1300,8 +1335,12 @@ function halkidiki_ai_build_deterministic_business_reply($context, $business_dat
         $scope = $b['match_scope'] ?? 'exact';
         $disp = $b['display_region'] ?? '';
         $cat = !empty($b['categories']) ? implode(', ', $b['categories']) : 'συνεργαζόμενη επιλογή';
-        $desc = 'Ταιριάζει σε αυτό που ζητάτε.';
-        if (!empty($cat)) $desc = 'Κατηγορία: ' . $cat . '.';
+        $desc = !empty($b['description']) ? $b['description'] : '';
+        if ($desc === '') {
+            $desc = 'Μια καλή επιλογή';
+            if ($disp !== '') $desc .= ' στην περιοχή ' . $disp;
+            $desc .= ' για αυτό που ζητάτε.';
+        }
         if ($scope === 'nearby' && $disp !== '') {
             $lines[] = "Κοντινή επιλογή στη {$disp}: {$name} — {$desc}";
         } else {
