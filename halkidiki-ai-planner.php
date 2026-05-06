@@ -1459,10 +1459,7 @@ function halkidiki_ai_format_business_reply_clean($resolved, $data) {
     }
     foreach (array_slice($items, 0, 6) as $b) {
         $name = html_entity_decode((string)($b['name'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-        $desc = trim((string)($b['description'] ?? ''));
-        if ($desc === '' || halkidiki_ai_normalize_text($desc) === halkidiki_ai_normalize_text($name)) {
-            $desc = 'Μια καλή επιλογή για αυτό που ζητάτε.';
-        }
+        $desc = halkidiki_ai_clean_business_description($b, $resolved['final_intent'] ?? '', $resolved['final_region'] ?? '');
         if (($b['match_scope'] ?? '') === 'nearby') {
             $lines[] = '- Κοντινή επιλογή στην ' . ($b['display_region'] ?? '') . ': ' . $name . ' — ' . $desc;
         } else {
@@ -1470,6 +1467,26 @@ function halkidiki_ai_format_business_reply_clean($resolved, $data) {
         }
     }
     return implode("\n", $lines);
+}
+
+function halkidiki_ai_clean_business_description($business, $intent, $region) {
+    $name = html_entity_decode((string)($business['name'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $desc = html_entity_decode((string)($business['description'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $desc = trim(wp_strip_all_tags($desc));
+    if ($desc !== '') {
+        $desc = preg_replace('/^' . preg_quote($name, '/') . '\s*[-–—:,.]?\s*/iu', '', $desc);
+        $desc = preg_replace('/^' . preg_quote(mb_strtoupper($name, 'UTF-8'), '/') . '\s*[-–—:,.]?\s*/u', '', $desc);
+        $parts = preg_split('/[.!;;]/u', $desc);
+        $desc = trim($parts[0] ?? $desc);
+    }
+    if ($desc === '' || halkidiki_ai_normalize_text($desc) === halkidiki_ai_normalize_text($name)) {
+        if ($intent === 'coffee') return 'Καλή επιλογή για καφέ και χαλαρή στάση στην περιοχή.';
+        if ($intent === 'drink' || $intent === 'nightlife') return 'Ιδανική επιλογή για ποτό ή βραδινή έξοδο στην περιοχή.';
+        if ($intent === 'food') return 'Καλή επιλογή για φαγητό και χαλαρή ατμόσφαιρα στην περιοχή.';
+        if ($intent === 'dessert' || $intent === 'icecream') return 'Ωραία επιλογή για γλυκό ή παγωτό στην περιοχή.';
+        return 'Μια καλή επιλογή για αυτό που ζητάτε.';
+    }
+    return wp_trim_words($desc, 18, '...');
 }
 
 function halkidiki_ai_detect_smalltalk($message) {
